@@ -4,49 +4,30 @@ from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 import struct
+import math
 
-# Distance thresholds
-STOP_DISTANCE = 1      # Stop completely within 0.8m
-SLOW_DISTANCE = 2.0      # Slow down within 2.0m
-SLOW_SPEED_FACTOR = 0.3  # Reduce speed to 30% when slowing
+STOP_DISTANCE = 1.0
+SLOW_DISTANCE = 2.5
+SLOW_SPEED_FACTOR = 0.3
 
-# Only consider points in front of the robot and at relevant heights
-MIN_HEIGHT = -0.1        # Ignore ground
-MAX_HEIGHT = 1.5         # Ignore things above robot
-FRONT_ANGLE = 60         # Degrees either side of forward direction
+MIN_HEIGHT = -0.1
+MAX_HEIGHT = 1.5
+FRONT_ANGLE = 60
 
 class ObstacleAvoidanceNode(Node):
     def __init__(self):
         super().__init__('obstacle_avoidance')
 
-        # Subscribe to PointCloud2 LiDAR data
         self.scan_subscriber = self.create_subscription(
-            PointCloud2,
-            '/velodyne_points',
-            self.pointcloud_callback,
-            10
+            PointCloud2, '/velodyne_points', self.pointcloud_callback, 10
         )
-
-        # Subscribe to raw velocity commands
         self.cmd_subscriber = self.create_subscription(
-            Twist,
-            '/cmd_vel_raw',
-            self.cmd_callback,
-            10
+            Twist, '/cmd_vel_raw', self.cmd_callback, 10
         )
-
-        # Subscribe to YOLO detections
         self.detection_subscriber = self.create_subscription(
-            String,
-            '/detections',
-            self.detection_callback,
-            10
+            String, '/detections', self.detection_callback, 10
         )
-
-        # Publish safe velocity commands
         self.cmd_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        # Publish status for voice feedback
         self.status_publisher = self.create_publisher(String, '/robot_status', 10)
 
         self.latest_cmd = Twist()
@@ -59,42 +40,28 @@ class ObstacleAvoidanceNode(Node):
         self.latest_detection = msg.data
 
     def pointcloud_callback(self, msg):
-        # Parse PointCloud2 message to find minimum distance to obstacles
-        # PointCloud2 data is packed binary - we need to unpack x, y, z
-        
-        point_step = msg.point_step  # bytes per point
+        point_step = msg.point_step
         data = msg.data
-
         min_dist = float('inf')
 
-        # Read each point
         for i in range(msg.width * msg.height):
             offset = i * point_step
-            
             try:
-                # Unpack x, y, z as floats (4 bytes each)
                 x = struct.unpack_from('f', data, offset)[0]
                 y = struct.unpack_from('f', data, offset + 4)[0]
                 z = struct.unpack_from('f', data, offset + 8)[0]
             except struct.error:
                 continue
 
-            # Filter out invalid points
             if not all(map(lambda v: -100 < v < 100, [x, y, z])):
                 continue
-
-            # Filter by height — ignore ground and things above robot
             if z < MIN_HEIGHT or z > MAX_HEIGHT:
                 continue
 
-            # Only consider points in front of robot
-            # x is forward, y is sideways
-            import math
             angle = math.degrees(math.atan2(y, x))
             if abs(angle) > FRONT_ANGLE:
                 continue
 
-            # Calculate horizontal distance
             dist = math.sqrt(x**2 + y**2)
             if dist < min_dist:
                 min_dist = dist
@@ -111,14 +78,20 @@ class ObstacleAvoidanceNode(Node):
         status = String()
 
         if self.min_distance < STOP_DISTANCE:
+            # Block forward movement only - allow backward and turning at full speed
+            safe_cmd.linear.x = 0.0 if cmd.linear.x > 0 else cmd.linear.x
+            safe_cmd.angular.z = cmd.angular.z
+
             status.data = f'STOP: obstacle at {self.min_distance:.2f}m'
             if self.latest_detection:
                 status.data += f' ({self.latest_detection})'
             self.get_logger().warn(status.data)
 
         elif self.min_distance < SLOW_DISTANCE:
-            safe_cmd.linear.x = cmd.linear.x * SLOW_SPEED_FACTOR
+            # Only slow forward movement - backward and turning stay normal
+            safe_cmd.linear.x = cmd.linear.x * SLOW_SPEED_FACTOR if cmd.linear.x > 0 else cmd.linear.x
             safe_cmd.angular.z = cmd.angular.z
+
             status.data = f'SLOW: obstacle at {self.min_distance:.2f}m'
             if self.latest_detection:
                 status.data += f' ({self.latest_detection})'
